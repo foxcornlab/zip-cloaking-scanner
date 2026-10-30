@@ -8,6 +8,9 @@ Two checks, no payloads, no exploitation, no extraction to disk:
 2. ZIP header check: parse a ZIP file's Central Directory entries and Local
    File Header entries without extracting any payload, and compare filenames
    entry by entry. A Central vs Local filename mismatch is flagged CLOAKED.
+   ZIP64 archives are graded the same way: saturated EOCD fields are
+   resolved via the ZIP64 EOCD record and locator, and saturated per-entry
+   fields via the ZIP64 extra field (0x0001).
 
 The flaw (GHSA-m665-v7pm-7grj): ZipArchive reads filenames from the Central
 Directory File Header (CDFH) and ignores the Local File Header (LFH), while
@@ -35,6 +38,8 @@ FIXED_MIN = (9, 0, 5)
 EOCD_SIG = b"PK\x05\x06"
 CENTRAL_SIG = b"PK\x01\x02"
 LOCAL_SIG = b"PK\x03\x04"
+ZIP64_EOCD_SIG = b"PK\x06\x06"
+ZIP64_LOCATOR_SIG = b"PK\x06\x07"
 
 # Structs include the 4-byte signature, so field indices match the layout:
 # EOCD: sig, disk, cd_disk, entries_disk, entries_total, cd_size,
@@ -47,6 +52,14 @@ LOCAL_SIG = b"PK\x03\x04"
 EOCD_STRUCT = struct.Struct("<IHHHHIIH")
 CENTRAL_STRUCT = struct.Struct("<IHHHHHHIIIHHHHHII")
 LOCAL_STRUCT = struct.Struct("<IHHHHHIIIHH")
+# ZIP64 End of Central Directory record (56 bytes, before any extensible
+# data): sig, record size, version made by, version needed, disk number,
+# disk with CD start, entries on this disk, entries total, CD size,
+# CD offset.
+ZIP64_EOCD_STRUCT = struct.Struct("<IQHHIIQQQQ")
+# ZIP64 End of Central Directory locator (20 bytes): sig, disk with the
+# ZIP64 EOCD record, offset of the ZIP64 EOCD record, total disks.
+ZIP64_LOCATOR_STRUCT = struct.Struct("<IIQI")
 
 
 class ScanError(Exception):
@@ -169,6 +182,89 @@ def scan_cargo_toml(path):
     return findings
 
 
+def parse_zip64_extra(extra, comp_size, uncomp_size, local_offset,
+                      disk_start, path, index):
+    """Resolve saturated fields from a ZIP64 extra field (0x0001).
+
+    The extra field carries values only for fields that were saturated, in
+    the standard order: uncompressed size, compressed size, local header
+    offset, disk start number. Values for unsaturated fields are absent,
+    so they must not be consumed. Returns the resolved
+    (comp_size, uncomp_size, local_offset, disk_start) tuple.
+    """
+    pos = 0
+    while pos + 4 <= len(extra):
+        header_id, data_size = struct.unpack_from("<HH", extra, pos)
+        pos += 4
+        if pos + data_size > len(extra):
+            raise ScanError(
+                "%s: truncated extra field at entry %d" % (path, index))
+        data = extra[pos:pos + data_size]
+        pos += data_size
+        if header_id != 0x0001:
+            continue
+        cursor = 0
+
+        def take(size, field_name):
+            nonlocal cursor
+            if cursor + size > len(data):
+                raise ScanError(
+                    "%s: truncated ZIP64 extra field at entry %d (%s)"
+                    % (path, index, field_name))
+            value = struct.unpack_from("<Q" if size == 8 else "<I",
+                                       data, cursor)[0]
+            cursor += size
+            return value
+
+        if uncomp_size == 0xFFFFFFFF:
+            uncomp_size = take(8, "uncompressed size")
+        if comp_size == 0xFFFFFFFF:
+            comp_size = take(8, "compressed size")
+        if local_offset == 0xFFFFFFFF:
+            local_offset = take(8, "local header offset")
+        if disk_start == 0xFFFF:
+            disk_start = take(4, "disk start number")
+    if pos != len(extra):
+        raise ScanError(
+            "%s: truncated extra field at entry %d" % (path, index))
+    return comp_size, uncomp_size, local_offset, disk_start
+
+
+def parse_zip64_eocd(handle, size, eocd_start, path):
+    """Resolve a saturated standard EOCD via the ZIP64 EOCD record.
+
+    The locator sits in the 20 bytes immediately before the standard EOCD
+    and points at the ZIP64 EOCD record. Returns
+    (entries_total, cd_size, cd_offset). Multi-disk archives are an error,
+    not a clean verdict.
+    """
+    if eocd_start < ZIP64_LOCATOR_STRUCT.size:
+        raise ScanError("%s: truncated ZIP64 locator" % path)
+    handle.seek(eocd_start - ZIP64_LOCATOR_STRUCT.size)
+    locator = handle.read(ZIP64_LOCATOR_STRUCT.size)
+    if len(locator) < ZIP64_LOCATOR_STRUCT.size:
+        raise ScanError("%s: truncated ZIP64 locator" % path)
+    if locator[:4] != ZIP64_LOCATOR_SIG:
+        raise ScanError("%s: missing ZIP64 locator" % path)
+    (_sig, _disk, zip64_offset, _total_disks) = \
+        ZIP64_LOCATOR_STRUCT.unpack(locator)
+    if zip64_offset >= size or \
+            zip64_offset + ZIP64_EOCD_STRUCT.size > size:
+        raise ScanError("%s: ZIP64 record offset out of range" % path)
+    handle.seek(zip64_offset)
+    record = handle.read(ZIP64_EOCD_STRUCT.size)
+    if len(record) < ZIP64_EOCD_STRUCT.size:
+        raise ScanError("%s: truncated ZIP64 record" % path)
+    if record[:4] != ZIP64_EOCD_SIG:
+        raise ScanError("%s: bad ZIP64 record signature" % path)
+    (_sig, _rec_size, _ver_made, _ver_needed, disk, cd_disk,
+     _entries_disk, entries_total, cd_size, cd_offset) = \
+        ZIP64_EOCD_STRUCT.unpack(record)
+    if disk != 0 or cd_disk != 0:
+        raise ScanError("%s: multi-disk ZIP64 archive not supported" % path)
+    return entries_total, cd_size, cd_offset
+
+
 def scan_zip_headers(path):
     """Compare CDFH vs LFH filenames for every entry, without extracting.
 
@@ -198,10 +294,15 @@ def scan_zip_headers(path):
         eocd = tail[offset:offset + EOCD_STRUCT.size]
         if len(eocd) < EOCD_STRUCT.size:
             raise ScanError("%s: truncated End of Central Directory" % path)
-        (_sig, _disk, _cd_disk, _entries_disk, entries_total, _cd_size,
+        (_sig, _disk, _cd_disk, entries_disk, entries_total, cd_size,
          cd_offset, _comment_len) = EOCD_STRUCT.unpack(eocd)
-        if entries_total == 0xFFFF or cd_offset == 0xFFFFFFFF:
-            raise ScanError("%s: ZIP64 archives are not supported" % path)
+        # Any saturated EOCD field means the real values live in the ZIP64
+        # record; resolve them instead of rejecting the archive.
+        if (entries_disk == 0xFFFF or entries_total == 0xFFFF
+                or cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF):
+            eocd_start = tail_start + offset
+            entries_total, cd_size, cd_offset = parse_zip64_eocd(
+                handle, size, eocd_start, path)
         if cd_offset >= size:
             raise ScanError(
                 "%s: central directory offset out of range" % path)
@@ -217,16 +318,34 @@ def scan_zip_headers(path):
                     "%s: bad central directory signature at entry %d"
                     % (path, index))
             fields = CENTRAL_STRUCT.unpack(header)
+            comp_size = fields[8]
+            uncomp_size = fields[9]
             fname_len = fields[10]
             extra_len = fields[11]
             comment_len = fields[12]
+            disk_start = fields[13]
             local_offset = fields[16]
             central_name = handle.read(fname_len)
             if len(central_name) < fname_len:
                 raise ScanError(
                     "%s: truncated central filename at entry %d" % (path, index))
-            # Skip extra field and comment to reach the next entry.
-            handle.seek(extra_len + comment_len, os.SEEK_CUR)
+            # Read the extra field (rather than skipping it) so a ZIP64
+            # extra field can resolve saturated size/offset fields. This
+            # is per entry, so standard and ZIP64 entries can mix.
+            extra = handle.read(extra_len)
+            if len(extra) < extra_len:
+                raise ScanError(
+                    "%s: truncated central extra field at entry %d"
+                    % (path, index))
+            (_comp, _uncomp, local_offset, disk_start) = parse_zip64_extra(
+                extra, comp_size, uncomp_size, local_offset, disk_start,
+                path, index)
+            if disk_start != 0:
+                raise ScanError(
+                    "%s: multi-disk archive not supported at entry %d"
+                    % (path, index))
+            # Skip the comment to reach the next entry.
+            handle.seek(comment_len, os.SEEK_CUR)
             if local_offset >= size:
                 raise ScanError(
                     "%s: local header offset out of range at entry %d"
