@@ -64,7 +64,7 @@ Exit codes: `0` = clean or unknown, `2` = vulnerable finding, `1` = scan error.
 
 - A public `PoC` exists, in the advisory itself. Wild exploitation is not confirmed. This scanner does triage, not proof of exploitability.
 - A version check alone does not prove a project is exploitable: the risk needs a `CDFH`-first inspector feeding a `ZipStreamReader` extractor, or a similar decoupled pipeline. A header mismatch alone does not prove compromise either, only that the archive is cloaked and must not be trusted.
-- `ZIP64` archives are reported as errors, not clean, because this parser does not handle them yet.
+- `ZIP64` archives are supported and graded like standard archives: saturated `EOCD` fields are resolved via the `ZIP64` record and locator, and saturated per-entry fields via the `ZIP64` extra field. Malformed or truncated `ZIP64` structures are still reported as errors, not clean.
 - `Cargo.toml` requirements are ranges. Grade the lockfile when you have it.
 
 ## `References`
