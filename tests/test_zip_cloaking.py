@@ -140,6 +140,179 @@ class TestZipHeaders(unittest.TestCase):
             zip_cloaking.scan_zip_headers("/nonexistent/nope.zip")
 
 
+def make_zip64_force_archive(path):
+    """One file written with force_zip64 (ZIP64 extra in the local header)."""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        with archive.open("hello.txt", "w", force_zip64=True) as handle:
+            handle.write(b"hello\n")
+
+
+def _rewrite_to_zip64(src, dst):
+    """Rewrite a standard archive as a full ZIP64 archive.
+
+    Every central entry gets saturated size/offset fields resolved by a
+    ZIP64 extra field (0x0001), and the standard EOCD is replaced by a
+    ZIP64 EOCD record plus locator plus a saturated standard EOCD.
+    Local headers and their offsets are unchanged, so the rewrite only
+    changes how the directory describes the same files.
+    """
+    import struct
+    with open(src, "rb") as handle:
+        data = handle.read()
+    eocd_at = data.rfind(b"PK\x05\x06")
+    assert eocd_at >= 0, "no EOCD in base archive"
+    eocd = struct.unpack("<IHHHHIIH", data[eocd_at:eocd_at + 22])
+    cd_offset, cd_size, entries = eocd[6], eocd[5], eocd[4]
+    prefix = data[:cd_offset]
+    cd = data[cd_offset:cd_offset + cd_size]
+    new_cd = bytearray()
+    pos = 0
+    while pos < len(cd):
+        fields = list(struct.unpack("<IHHHHHHIIIHHHHHII",
+                                    cd[pos:pos + 46]))
+        fname_len, extra_len, comment_len = fields[10], fields[11], fields[12]
+        fname_start = pos + 46
+        fname = cd[fname_start:fname_start + fname_len]
+        extra_start = fname_start + fname_len
+        extra = cd[extra_start:extra_start + extra_len]
+        comment_start = extra_start + extra_len
+        comment = cd[comment_start:comment_start + comment_len]
+        real_comp, real_uncomp, real_local = fields[8], fields[9], fields[16]
+        zip64_data = struct.pack("<QQQ", real_uncomp, real_comp, real_local)
+        zip64_extra = struct.pack("<HH", 0x0001, len(zip64_data)) + zip64_data
+        new_extra = extra + zip64_extra
+        fields[8] = 0xFFFFFFFF
+        fields[9] = 0xFFFFFFFF
+        fields[11] = len(new_extra)
+        fields[16] = 0xFFFFFFFF
+        new_cd += struct.pack("<IHHHHHHIIIHHHHHII", *fields)
+        new_cd += fname + new_extra + comment
+        pos += 46 + fname_len + extra_len + comment_len
+    new_cd_size = len(new_cd)
+    zip64_eocd_offset = cd_offset + new_cd_size
+    zip64_eocd = struct.pack("<IQHHIIQQQQ", 0x06064b50, 44, 45, 45,
+                             0, 0, entries, entries, new_cd_size, cd_offset)
+    locator = struct.pack("<IIQI", 0x07064b50, 0, zip64_eocd_offset, 1)
+    eocd_new = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 0xFFFF, 0xFFFF,
+                           0xFFFFFFFF, 0xFFFFFFFF, 0)
+    with open(dst, "wb") as handle:
+        handle.write(prefix + bytes(new_cd) + zip64_eocd + locator + eocd_new)
+
+
+def _saturate_eocd(src, dst):
+    """Keep central entries standard, saturate only the EOCD.
+
+    Exercises the ZIP64 EOCD record + locator path without per-entry
+    ZIP64 extras.
+    """
+    import struct
+    with open(src, "rb") as handle:
+        data = handle.read()
+    eocd_at = data.rfind(b"PK\x05\x06")
+    assert eocd_at >= 0, "no EOCD in base archive"
+    eocd = struct.unpack("<IHHHHIIH", data[eocd_at:eocd_at + 22])
+    cd_offset, cd_size, entries = eocd[6], eocd[5], eocd[4]
+    zip64_eocd = struct.pack("<IQHHIIQQQQ", 0x06064b50, 44, 45, 45,
+                             0, 0, entries, entries, cd_size, cd_offset)
+    locator = struct.pack("<IIQI", 0x07064b50, 0, eocd_at, 1)
+    eocd_new = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 0xFFFF, 0xFFFF,
+                           0xFFFFFFFF, 0xFFFFFFFF, 0)
+    with open(dst, "wb") as handle:
+        handle.write(data[:eocd_at] + zip64_eocd + locator + eocd_new)
+
+
+def make_full_zip64_archive(path, cloaked=False):
+    base = path + ".base"
+    if cloaked:
+        make_cloaked_archive(base)
+    else:
+        make_benign_archive(base)
+    try:
+        _rewrite_to_zip64(base, path)
+    finally:
+        if os.path.exists(base):
+            os.remove(base)
+
+
+def make_saturated_eocd_archive(path, cloaked=False):
+    base = path + ".base"
+    if cloaked:
+        make_cloaked_archive(base)
+    else:
+        make_benign_archive(base)
+    try:
+        _saturate_eocd(base, path)
+    finally:
+        if os.path.exists(base):
+            os.remove(base)
+
+
+class TestZip64(unittest.TestCase):
+    def test_force_zip64_benign_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "z64.zip")
+            make_zip64_force_archive(archive)
+            findings = zip_cloaking.scan_zip_headers(archive)
+            self.assertTrue(findings)
+            self.assertTrue(all(f["status"] == "CLEAN" for f in findings))
+            detail = " ".join(f["detail"] for f in findings)
+            self.assertIn("hello.txt", detail)
+
+    def test_full_zip64_benign_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "z64full.zip")
+            make_full_zip64_archive(archive)
+            with open(archive, "rb") as handle:
+                raw = handle.read()
+            # Guard: this really is a ZIP64 archive, not a standard one.
+            self.assertIn(b"PK\x06\x06", raw)
+            self.assertIn(b"PK\x06\x07", raw)
+            findings = zip_cloaking.scan_zip_headers(archive)
+            self.assertTrue(findings)
+            self.assertTrue(all(f["status"] == "CLEAN" for f in findings))
+            detail = " ".join(f["detail"] for f in findings)
+            self.assertIn("hello.txt", detail)
+
+    def test_full_zip64_cloaked_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "z64cloaked.zip")
+            make_full_zip64_archive(archive, cloaked=True)
+            findings = zip_cloaking.scan_zip_headers(archive)
+            self.assertTrue(any(f["status"] == "CLOAKED" for f in findings))
+            detail = " ".join(f["detail"] for f in findings)
+            self.assertIn("doc_report.pdf", detail)
+            self.assertIn("cron_worker.sh", detail)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "cron_worker.sh")))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "doc_report.pdf")))
+
+    def test_saturated_eocd_only_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "sat.zip")
+            make_saturated_eocd_archive(archive)
+            findings = zip_cloaking.scan_zip_headers(archive)
+            self.assertTrue(findings)
+            self.assertTrue(all(f["status"] == "CLEAN" for f in findings))
+            detail = " ".join(f["detail"] for f in findings)
+            self.assertIn("hello.txt", detail)
+
+    def test_saturated_eocd_only_cloaked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "satcloaked.zip")
+            make_saturated_eocd_archive(archive, cloaked=True)
+            findings = zip_cloaking.scan_zip_headers(archive)
+            self.assertTrue(any(f["status"] == "CLOAKED" for f in findings))
+
+    def test_truncated_zip64_is_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "trunc.zip")
+            make_full_zip64_archive(archive)
+            # Cut the file inside the ZIP64 EOCD record region.
+            with open(archive, "r+b") as handle:
+                handle.truncate(os.path.getsize(archive) - 30)
+            with self.assertRaises(zip_cloaking.ScanError):
+                zip_cloaking.scan_zip_headers(archive)
+
+
 class TestCli(unittest.TestCase):
     def run_cli(self, *args):
         return subprocess.run(
@@ -190,6 +363,23 @@ class TestCli(unittest.TestCase):
                 handle.write(b"not a zip")
             result = self.run_cli("--zip", bad)
             self.assertEqual(result.returncode, 1)
+
+    def test_zip64_cli_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "z64.zip")
+            make_full_zip64_archive(archive)
+            result = self.run_cli("--zip", archive)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("verdict: CLEAN", result.stdout)
+
+    def test_zip64_cli_cloaked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "z64cloaked.zip")
+            make_full_zip64_archive(archive, cloaked=True)
+            result = self.run_cli("--zip", archive)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("verdict: VULNERABLE", result.stdout)
+            self.assertIn("CLOAKED", result.stdout)
 
     def test_json_output(self):
         with tempfile.TemporaryDirectory() as tmp:
